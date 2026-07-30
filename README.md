@@ -20,6 +20,7 @@ Mit dem Programm können einfache Abläufe aus mehreren Schritten erstellt werde
 - Wartezeiten zwischen einzelnen Schritten festlegen und komfortabel bearbeiten
 - Keine feste Schrittgrenze (auch umfangreiche Abläufe bis etwa 1000 Schritte sind möglich)
 - Schritte hinzufügen, bearbeiten, löschen und verschieben
+- Kommentare/Notizen werden gelb hervorgehoben und sind nach dem Anlegen schreibgeschützt
 - Abläufe als JSON-Datei speichern und laden
 - Tägliche Ausführung zu einer bestimmten Uhrzeit
 - Ausführung über ein frei einstellbares Intervall
@@ -184,7 +185,7 @@ Markiert den Inhalt des aktuell fokussierten Feldes mit `Strg+A` und löscht ihn
 
 ### Kommentar/Notiz
 
-Ein frei editierbarer Hinweis in der Schritteliste. Kommentare werden nicht ausgeführt, aber mit Zeitstempel in der Logdatei protokolliert.
+Ein Hinweis in der Schritteliste. Beim Anlegen kann der Text eingegeben werden; danach ist die Notiz schreibgeschützt und wird gelb hervorgehoben. Kommentare werden nicht ausgeführt, aber mit Zeitstempel in der Logdatei protokolliert.
 
 ### Timer
 

@@ -111,8 +111,10 @@ class OCRMacroApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1000x800")
-        self.root.minsize(900, 650)
+        screen_height = self.root.winfo_screenheight()
+        initial_height = min(800, max(650, screen_height - 70))
+        self.root.geometry(f"1000x{initial_height}")
+        self.root.minsize(900, min(650, max(560, screen_height - 70)))
         self.config = dict(DEFAULT_CONFIG)
         self.steps = []
         self.selected_step = None
@@ -166,28 +168,39 @@ class OCRMacroApp:
 
         steps_box = ttk.LabelFrame(edit, text="Ablauf - keine feste Schrittgrenze (empfohlen: bis 1000)", padding=10); steps_box.pack(fill="both", expand=True, pady=(0, 8))
         list_area = ttk.Frame(steps_box); list_area.pack(side="left", fill="both", expand=True)
-        self.step_list = tk.Listbox(list_area, height=16, activestyle="dotbox", exportselection=False)
+        self.step_list = tk.Listbox(
+            list_area,
+            height=16,
+            activestyle="dotbox",
+            exportselection=False,
+            selectbackground="#cfe8ff",
+            selectforeground="#000000",
+        )
         step_scroll = ttk.Scrollbar(list_area, orient="vertical", command=self.step_list.yview)
         self.step_list.configure(yscrollcommand=step_scroll.set)
         self.step_list.pack(side="left", fill="both", expand=True); step_scroll.pack(side="right", fill="y")
         self.step_list.bind("<<ListboxSelect>>", self.step_selected)
         self.step_list.bind("<Double-Button-1>", lambda e: self.edit_step())
         controls = ttk.Frame(steps_box); controls.pack(side="left", fill="y", padx=(10, 0))
-        ttk.Button(controls, text="+ Klick", command=lambda: self.add_step("Klick")).pack(fill="x", pady=2)
-        ttk.Button(controls, text="+ OCR kopieren", command=lambda: self.add_step("OCR kopieren")).pack(fill="x", pady=2)
-        ttk.Button(controls, text="+ OCR einfuegen", command=lambda: self.add_step("OCR einfuegen")).pack(fill="x", pady=2)
-        ttk.Button(controls, text="+ Text einfuegen", command=lambda: self.add_step("Text einfuegen")).pack(fill="x", pady=2)
-        ttk.Button(controls, text="+ Tab-Taste", command=lambda: self.add_step("Tab-Taste")).pack(fill="x", pady=2)
-        ttk.Button(controls, text="+ Tastenkombination", command=lambda: self.add_step("Tastenkombination")).pack(fill="x", pady=2)
-        ttk.Button(controls, text="+ Text löschen", command=lambda: self.add_step("Text löschen")).pack(fill="x", pady=2)
-        ttk.Button(controls, text="+ Kommentar/Notiz", command=lambda: self.add_step("Kommentar/Notiz")).pack(fill="x", pady=2)
-        ttk.Button(controls, text="+ Enter", command=lambda: self.add_step("Enter")).pack(fill="x", pady=2)
-        ttk.Button(controls, text="+ Timer", command=lambda: self.add_step("Timer")).pack(fill="x", pady=2)
-        ttk.Separator(controls).pack(fill="x", pady=6)
-        ttk.Button(controls, text="Bearbeiten", command=self.edit_step).pack(fill="x", pady=2)
-        ttk.Button(controls, text="Loeschen", command=self.delete_step).pack(fill="x", pady=2)
-        ttk.Button(controls, text="Nach oben", command=lambda: self.move_step(-1)).pack(fill="x", pady=2)
-        ttk.Button(controls, text="Nach unten", command=lambda: self.move_step(1)).pack(fill="x", pady=2)
+        control_specs = (
+            ("+ Klick", "Klick"), ("+ OCR kopieren", "OCR kopieren"),
+            ("+ OCR einfuegen", "OCR einfuegen"), ("+ Text einfuegen", "Text einfuegen"),
+            ("+ Tab-Taste", "Tab-Taste"), ("+ Tastenkombination", "Tastenkombination"),
+            ("+ Text löschen", "Text löschen"), ("+ Kommentar/Notiz", "Kommentar/Notiz"),
+            ("+ Enter", "Enter"), ("+ Timer", "Timer"),
+        )
+        for index, (label, kind) in enumerate(control_specs):
+            ttk.Button(controls, text=label, command=lambda step_kind=kind: self.add_step(step_kind)).grid(
+                row=index // 2, column=index % 2, sticky="ew", padx=2, pady=2
+            )
+        controls.columnconfigure(0, weight=1); controls.columnconfigure(1, weight=1)
+        action_row = len(control_specs) // 2 + 1
+        ttk.Separator(controls).grid(row=action_row - 1, column=0, columnspan=2, sticky="ew", pady=6)
+        self.edit_button = ttk.Button(controls, text="Bearbeiten", command=self.edit_step)
+        self.edit_button.grid(row=action_row, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+        ttk.Button(controls, text="Loeschen", command=self.delete_step).grid(row=action_row + 1, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+        ttk.Button(controls, text="Nach oben", command=lambda: self.move_step(-1)).grid(row=action_row + 2, column=0, sticky="ew", padx=2, pady=2)
+        ttk.Button(controls, text="Nach unten", command=lambda: self.move_step(1)).grid(row=action_row + 2, column=1, sticky="ew", padx=2, pady=2)
 
         sched = ttk.LabelFrame(edit, text="Zeitplan", padding=8); sched.pack(fill="x", pady=(0, 8))
         ttk.Radiobutton(sched, text="Deaktiviert", variable=self.schedule_mode_var, value="off").grid(row=0, column=0, sticky="w")
@@ -256,9 +269,14 @@ class OCRMacroApp:
                 detail = f" - {note[:45]}{'...' if len(note) > 45 else ''}" if note else " - leer"
             elif step["type"] == "Timer": detail = f" - {step.get('seconds', 1)} s"
             self.step_list.insert(tk.END, f"{i}. {step['type']}{detail}")
+            if step["type"] == "Kommentar/Notiz":
+                self.step_list.itemconfig(tk.END, background="#fff3b0", foreground="#5f4b00")
 
     def step_selected(self, event=None):
         sel = self.step_list.curselection(); self.selected_step = sel[0] if sel else None
+        if hasattr(self, "edit_button"):
+            is_note = self.selected_step is not None and self.steps[self.selected_step]["type"] == "Kommentar/Notiz"
+            self.edit_button.configure(state="disabled" if is_note else "normal")
 
     def add_step(self, kind):
         step = {"type": kind}
@@ -269,11 +287,16 @@ class OCRMacroApp:
         elif kind in ("Tastenkombination", "Kommentar/Notiz"):
             step["keys" if kind == "Tastenkombination" else "text"] = ""
         self.steps.append(step); self.refresh_steps(); self.step_list.selection_set(len(self.steps)-1); self.step_selected()
-        if kind in ("Klick", "OCR kopieren", "Text einfuegen", "Tastenkombination", "Kommentar/Notiz"): self.edit_step()
+        if kind in ("Klick", "OCR kopieren", "Text einfuegen", "Tastenkombination"): self.edit_step()
+        elif kind == "Kommentar/Notiz":
+            self.edit_text_step(step, "Kommentar/Notiz anlegen", "Notiz (nach dem Speichern schreibgeschützt):", allow_empty=True)
 
     def edit_step(self):
         if self.selected_step is None: messagebox.showinfo("Schritt auswaehlen", "Bitte zuerst einen Schritt auswaehlen."); return
         step = self.steps[self.selected_step]; kind = step["type"]
+        if kind == "Kommentar/Notiz":
+            messagebox.showinfo("Notiz schreibgeschützt", "Notizen sind nach dem Anlegen schreibgeschützt.", parent=self.root)
+            return
         if kind == "Klick":
             self.root.withdraw(); self.root.after(250, lambda: SelectionOverlay(self.root, "region", lambda v: self.set_step_value("target", v)))
         elif kind == "OCR kopieren":

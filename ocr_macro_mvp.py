@@ -38,7 +38,7 @@ if pyautogui is not None:
     pyautogui.FAILSAFE = True
 
 APP_TITLE = "OCR Macro MVP Designer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 DEVELOPER = "Niclas Kersting"
 REPOSITORY_URL = "https://github.com/NKAutomations/OCR_Macro_MVP"
 LATEST_RELEASE_URL = f"{REPOSITORY_URL}/releases/latest"

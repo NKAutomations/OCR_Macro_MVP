@@ -2,7 +2,7 @@
 
 Ein kleiner und schlanker Makro-Generator für Windows mit OCR-Unterstützung.
 
-**Version:** 1.0.0 · **Entwickler:** Niclas Kersting  
+**Version:** 1.0.2 · **Entwickler:** Niclas Kersting  
 **Aktuelles Release:** <https://github.com/NKAutomations/OCR_Macro_MVP/releases/latest>
 
 Mit dem Programm können einfache Abläufe aus mehreren Schritten erstellt werden. Die Schritte werden anschließend automatisch in der festgelegten Reihenfolge ausgeführt.
@@ -64,6 +64,15 @@ py --version
 
 `pytesseract` ist nur die Python-Schnittstelle. Für die eigentliche Texterkennung wird zusätzlich die Tesseract-OCR-Engine benötigt.
 
+### Windows-Installation
+
+1. Öffne die [Tesseract-OCR-Releases auf GitHub](https://github.com/tesseract-ocr/tesseract/releases), um die offiziellen Projektversionen und Release-Informationen zu prüfen.
+2. Für einen fertigen Windows-Installer kannst du die [Windows-Builds und Installationshinweise von UB Mannheim](https://github.com/UB-Mannheim/tesseract/wiki) verwenden.
+3. Installiere Tesseract mit den Standardoptionen. Eine Installation nach
+	`C:\Program Files\Tesseract-OCR\` ist empfehlenswert.
+4. Falls zusätzliche OCR-Sprachen benötigt werden, installiere die passenden Sprachdaten (`.traineddata`) mit und merke dir den Installationsordner.
+5. Starte anschließend das OCR Macro MVP und wähle im Tab **Einstellungen** die Datei `tesseract.exe` aus.
+
 Nach der Installation liegt Tesseract häufig hier:
 
 ```text
@@ -77,6 +86,22 @@ tesseract --version
 ```
 
 Wenn Tesseract nicht über die Eingabeaufforderung gefunden wird, kann der Pfad im Tab **Einstellungen** ausgewählt werden. Die Einstellung wird persistent gespeichert.
+
+### Geplante OCR-Einstellungen
+
+Die aktuelle Version verwendet eine feste, für gewöhnlichen Bildschirmtext optimierte Verarbeitung: Graustufen, zweifache Bildvergrößerung, Kontrastverstärkung, Schärfung und den Tesseract-Modus `--psm 7`. Für zukünftige Versionen sind folgende Einstellungen sinnvoll:
+
+- OCR-Sprache, zum Beispiel Deutsch oder Englisch
+- frei wählbarer Tesseract-Page-Segmentation-Modus (`PSM`)
+- einstellbare Bildvergrößerung
+- optionales Schwarz-Weiß-Schwellenwertverfahren für schwachen Kontrast
+- optionale Rauschreduzierung und Schärfung
+- OCR-Timeout für langsame Rechner oder problematische Bereiche
+- einstellbare Wiederholungsversuche bei leerem OCR-Ergebnis
+- optionale Mindestqualität beziehungsweise Konfidenzprüfung
+- Normalisierung von Leerzeichen, Zeilenumbrüchen und Sonderzeichen
+
+Diese Optionen sollen die Erkennung bei kleinen Schriften, schlechter Darstellung und langsamen Rechnern verbessern, ohne die Standardbedienung unnötig kompliziert zu machen.
 
 ## 3. Python-Pakete installieren
 
@@ -299,7 +324,7 @@ Die fertige Datei befindet sich anschließend normalerweise hier:
 dist\OCR_Macro_MVP_Designer.exe
 ```
 
-Für den veröffentlichten v1.0.0-Release sollte diese EXE als Asset am GitHub-Release angehängt werden.
+Für den veröffentlichten v1.0.2-Release sollte diese EXE als Asset am GitHub-Release angehängt werden.
 
 Die EXE kann anschließend auf einem Windows-Rechner gestartet werden.
 

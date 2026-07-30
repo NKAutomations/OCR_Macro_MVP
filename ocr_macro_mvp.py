@@ -38,7 +38,7 @@ if pyautogui is not None:
     pyautogui.FAILSAFE = True
 
 APP_TITLE = "OCR Macro MVP Designer"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 DEVELOPER = "Niclas Kersting"
 REPOSITORY_URL = "https://github.com/NKAutomations/OCR_Macro_MVP"
 LATEST_RELEASE_URL = f"{REPOSITORY_URL}/releases/latest"
@@ -119,6 +119,8 @@ class OCRMacroApp:
         self.steps = []
         self.selected_step = None
         self.running = False
+        self.scheduler_active = False
+        self.scheduler_generation = 0
         self.scheduler_thread = None
         self.scheduler_next_run = None
         self.schedule_mode_var = tk.StringVar(value="off")
@@ -256,19 +258,39 @@ class OCRMacroApp:
 
     def refresh_steps(self):
         self.step_list.delete(0, tk.END)
+        self.step_list.configure(selectbackground="#cfe8ff", selectforeground="#000000")
         for i, step in enumerate(self.steps, 1):
             detail = ""
-            if step["type"] == "Klick": detail = " - Bereich/Punkt festgelegt" if step.get("target") else " - nicht konfiguriert"
-            elif step["type"] == "OCR kopieren": detail = " - Bereich festgelegt" if step.get("region") else " - nicht konfiguriert"
+            if step["type"] == "Klick":
+                target = step.get("target")
+                if target and len(target) >= 4:
+                    try:
+                        x1, y1, x2, y2 = map(int, target[:4])
+                        detail = f" - x:{(x1 + x2) // 2}, y:{(y1 + y2) // 2}"
+                    except (TypeError, ValueError):
+                        detail = " - Koordinate ungültig"
+                else:
+                    detail = " - nicht konfiguriert"
+            elif step["type"] == "OCR kopieren":
+                region = step.get("region")
+                if region and len(region) >= 4:
+                    try:
+                        x1, y1, x2, y2 = map(int, region[:4])
+                        detail = f" - x:{x1}, y:{y1} bis x:{x2}, y:{y2}"
+                    except (TypeError, ValueError):
+                        detail = " - Bereich ungültig"
+                else:
+                    detail = " - nicht konfiguriert"
             elif step["type"] == "Text einfuegen":
                 text = " ".join(str(step.get("text", "")).split())
                 detail = f" - \"{text[:45]}{'...' if len(text) > 45 else ''}\"" if text else " - nicht konfiguriert"
             elif step["type"] == "Tastenkombination": detail = f" - {step.get('keys', '')}" if step.get("keys") else " - nicht konfiguriert"
             elif step["type"] == "Kommentar/Notiz":
                 note = " ".join(str(step.get("text", "")).split())
-                detail = f" - {note[:45]}{'...' if len(note) > 45 else ''}" if note else " - leer"
+                detail = f": {note[:45]}{'...' if len(note) > 45 else ''}" if note else ": leer"
             elif step["type"] == "Timer": detail = f" - {step.get('seconds', 1)} s"
-            self.step_list.insert(tk.END, f"{i}. {step['type']}{detail}")
+            display_type = "Notiz" if step["type"] == "Kommentar/Notiz" else step["type"]
+            self.step_list.insert(tk.END, f"{i}. {display_type}{detail}")
             if step["type"] == "Kommentar/Notiz":
                 self.step_list.itemconfig(tk.END, background="#fff3b0", foreground="#5f4b00")
 
@@ -277,6 +299,10 @@ class OCRMacroApp:
         if hasattr(self, "edit_button"):
             is_note = self.selected_step is not None and self.steps[self.selected_step]["type"] == "Kommentar/Notiz"
             self.edit_button.configure(state="disabled" if is_note else "normal")
+            self.step_list.configure(
+                selectbackground="#fff3b0" if is_note else "#cfe8ff",
+                selectforeground="#5f4b00" if is_note else "#000000",
+            )
 
     def add_step(self, kind):
         step = {"type": kind}
@@ -286,7 +312,10 @@ class OCRMacroApp:
             step["text"] = ""
         elif kind in ("Tastenkombination", "Kommentar/Notiz"):
             step["keys" if kind == "Tastenkombination" else "text"] = ""
-        self.steps.append(step); self.refresh_steps(); self.step_list.selection_set(len(self.steps)-1); self.step_selected()
+        insert_at = self.selected_step if self.selected_step is not None else len(self.steps)
+        self.steps.insert(insert_at, step)
+        self.selected_step = insert_at
+        self.refresh_steps(); self.step_list.selection_set(insert_at); self.step_selected()
         if kind in ("Klick", "OCR kopieren", "Text einfuegen", "Tastenkombination"): self.edit_step()
         elif kind == "Kommentar/Notiz":
             self.edit_text_step(step, "Kommentar/Notiz anlegen", "Notiz (nach dem Speichern schreibgeschützt):", allow_empty=True)
@@ -462,6 +491,8 @@ class OCRMacroApp:
 
     def apply_config(self, data):
         self.config = dict(DEFAULT_CONFIG); self.config.update(data)
+        self.scheduler_active = False
+        self.scheduler_generation += 1
         self.steps = self.config.get("steps", [])
         mode = self.config.get("schedule_mode")
         if mode not in ("off", "daily", "interval"):
@@ -601,18 +632,23 @@ class OCRMacroApp:
         if mode == "off":
             messagebox.showinfo("Zeitplan auswählen", "Bitte Täglich oder Intervall auswählen.")
             return
-        if self.scheduler_thread and self.scheduler_thread.is_alive(): self.status.set("Zeitplan laeuft bereits."); return
+        if self.scheduler_active:
+            self.status.set("Zeitplan laeuft bereits.")
+            return
         self.config["schedule_enabled"] = True; self.config["schedule_mode"] = mode
+        self.scheduler_active = True
+        self.scheduler_generation += 1
+        generation = self.scheduler_generation
         self.log_event(f"Zeitplan gestartet: {mode}")
         self.scheduler_next_run = self.calculate_next_run(datetime.now(), mode)
-        self.scheduler_thread = threading.Thread(target=self.scheduler, daemon=True); self.scheduler_thread.start()
+        self.scheduler_thread = threading.Thread(target=self.scheduler, args=(generation,), daemon=True); self.scheduler_thread.start()
         self.schedule_button.configure(text="Run-Zeitplan stoppen", bg="#198754", activebackground="#146c43")
         self.update_next_run_display()
         description = f"täglich um {self.time_var.get()} Uhr" if mode == "daily" else f"alle {self.interval_var.get()} Minuten"
         self.status.set(f"Zeitplan aktiv: {description}.")
 
     def toggle_scheduler(self):
-        if self.config.get("schedule_enabled"):
+        if self.scheduler_active:
             self.stop_scheduler()
         else:
             self.start_scheduler()
@@ -633,8 +669,8 @@ class OCRMacroApp:
         else:
             self.next_run_var.set(f"Nächster Termin: {self.scheduler_next_run.strftime('%d.%m.%Y %H:%M:%S')}")
 
-    def scheduler(self):
-        while self.config.get("schedule_enabled"):
+    def scheduler(self, generation):
+        while self.scheduler_active and generation == self.scheduler_generation:
             now = datetime.now()
             if self.scheduler_next_run and now >= self.scheduler_next_run and not self.running:
                 self.scheduler_next_run = self.calculate_next_run(now, self.config.get("schedule_mode", "off"))
@@ -652,7 +688,10 @@ class OCRMacroApp:
                 self.show_user_message("info", "Ablauf abgebrochen", "Der aktuelle Ablauf wurde manuell abgebrochen.")
 
     def stop_scheduler(self):
-        self.config["schedule_enabled"] = False; self.config["schedule_mode"] = "off"; self.schedule_mode_var.set("off")
+        self.scheduler_active = False
+        self.scheduler_generation += 1
+        self.config["schedule_enabled"] = False
+        self.config["schedule_mode"] = self.schedule_mode_var.get()
         self.log_event("Zeitplan gestoppt")
         self.scheduler_next_run = None
         self.update_next_run_display()
@@ -660,7 +699,7 @@ class OCRMacroApp:
         self.status.set("Zeitplan gestoppt.")
 
     def stop(self, from_hotkey=False):
-        was_active = self.running or self.config.get("schedule_enabled", False)
+        was_active = self.running or self.scheduler_active
         self.stop_run()
         self.stop_scheduler()
         if from_hotkey and was_active:
@@ -681,6 +720,8 @@ class OCRMacroApp:
 
     def close(self):
         self.hotkey_running = False
+        self.scheduler_active = False
+        self.scheduler_generation += 1
         self.config["schedule_enabled"] = False
         self.root.destroy()
 

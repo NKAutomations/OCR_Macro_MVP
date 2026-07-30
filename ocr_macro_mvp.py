@@ -38,7 +38,7 @@ if pyautogui is not None:
     pyautogui.FAILSAFE = True
 
 APP_TITLE = "OCR Macro MVP Designer"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 DEVELOPER = "Niclas Kersting"
 REPOSITORY_URL = "https://github.com/NKAutomations/OCR_Macro_MVP"
 LATEST_RELEASE_URL = f"{REPOSITORY_URL}/releases/latest"
@@ -118,6 +118,7 @@ class OCRMacroApp:
         self.config = dict(DEFAULT_CONFIG)
         self.steps = []
         self.selected_step = None
+        self.inserted_step_index = None
         self.running = False
         self.scheduler_active = False
         self.scheduler_generation = 0
@@ -312,13 +313,29 @@ class OCRMacroApp:
             step["text"] = ""
         elif kind in ("Tastenkombination", "Kommentar/Notiz"):
             step["keys" if kind == "Tastenkombination" else "text"] = ""
-        insert_at = self.selected_step if self.selected_step is not None else len(self.steps)
+        if self.selected_step is None or self.selected_step == len(self.steps) - 1:
+            insert_at = len(self.steps)
+        else:
+            insert_at = self.selected_step
         self.steps.insert(insert_at, step)
         self.selected_step = insert_at
+        self.inserted_step_index = insert_at
         self.refresh_steps(); self.step_list.selection_set(insert_at); self.step_selected()
         if kind in ("Klick", "OCR kopieren", "Text einfuegen", "Tastenkombination"): self.edit_step()
         elif kind == "Kommentar/Notiz":
             self.edit_text_step(step, "Kommentar/Notiz anlegen", "Notiz (nach dem Speichern schreibgeschützt):", allow_empty=True)
+        else:
+            self.finish_inserted_step()
+
+    def finish_inserted_step(self):
+        if self.inserted_step_index is None or not self.steps:
+            return
+        self.inserted_step_index = None
+        self.selected_step = len(self.steps) - 1
+        self.step_list.selection_clear(0, tk.END)
+        self.step_list.selection_set(self.selected_step)
+        self.step_list.see(self.selected_step)
+        self.step_selected()
 
     def edit_step(self):
         if self.selected_step is None: messagebox.showinfo("Schritt auswaehlen", "Bitte zuerst einen Schritt auswaehlen."); return
@@ -345,6 +362,7 @@ class OCRMacroApp:
                 if not keys:
                     messagebox.showerror("Eingabe prüfen", "Bitte eine Tastenkombination eingeben.", parent=dialog); return
                 step["keys"] = keys; dialog.destroy(); self.refresh_steps(); self.step_list.selection_set(self.selected_step)
+                if self.inserted_step_index is not None: self.finish_inserted_step()
             ttk.Button(frame, text="Speichern", command=save_hotkey).pack(anchor="e")
             dialog.bind("<Return>", lambda e: save_hotkey())
             self.position_dialog(dialog)
@@ -360,6 +378,7 @@ class OCRMacroApp:
                 try: value = max(0.0, float(var.get().replace(",", ".")))
                 except ValueError: messagebox.showerror("Eingabe pruefen", "Bitte eine Zahl eingeben.", parent=dialog); return
                 step["seconds"] = value; dialog.destroy(); self.refresh_steps()
+                if self.inserted_step_index is not None: self.finish_inserted_step()
             ttk.Button(frame, text="Speichern", command=save).grid(row=2, column=0, sticky="e")
             dialog.bind("<Return>", lambda e: save())
             dialog.update_idletasks()
@@ -388,12 +407,14 @@ class OCRMacroApp:
             if not allow_empty and not text:
                 messagebox.showerror("Eingabe prüfen", "Bitte einen Text eingeben.", parent=dialog); return
             step["text"] = text; dialog.destroy(); self.refresh_steps(); self.step_list.selection_set(self.selected_step)
+            if self.inserted_step_index is not None: self.finish_inserted_step()
         ttk.Button(frame, text="Speichern", command=save_text).pack(anchor="e")
         dialog.bind("<Control-Return>", lambda e: save_text())
         self.position_dialog(dialog)
 
     def set_step_value(self, key, value):
         self.root.deiconify(); self.steps[self.selected_step][key] = value; self.refresh_steps(); self.step_list.selection_set(self.selected_step); self.status.set("Schritt gespeichert.")
+        if self.inserted_step_index is not None: self.finish_inserted_step()
 
     def delete_step(self):
         if self.selected_step is not None: self.steps.pop(self.selected_step); self.selected_step = None; self.refresh_steps()

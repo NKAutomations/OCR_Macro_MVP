@@ -2,7 +2,7 @@
 
 Ein kleiner und schlanker Makro-Generator für Windows mit OCR-Unterstützung.
 
-**Version:** 1.0.2 · **Entwickler:** Niclas Kersting  
+**Version:** 1.0.3 · **Entwickler:** Niclas Kersting  
 **Aktuelles Release:** <https://github.com/NKAutomations/OCR_Macro_MVP/releases/latest>
 
 Mit dem Programm können einfache Abläufe aus mehreren Schritten erstellt werden. Die Schritte werden anschließend automatisch in der festgelegten Reihenfolge ausgeführt.
@@ -324,7 +324,7 @@ Die fertige Datei befindet sich anschließend normalerweise hier:
 dist\OCR_Macro_MVP_Designer.exe
 ```
 
-Für den veröffentlichten v1.0.2-Release sollte diese EXE als Asset am GitHub-Release angehängt werden.
+Für den veröffentlichten v1.0.3-Release sollte diese EXE als Asset am GitHub-Release angehängt werden.
 
 Die EXE kann anschließend auf einem Windows-Rechner gestartet werden.
 

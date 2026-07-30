@@ -1,6 +1,9 @@
-# OCR Macro
+# OCR Macro MVP Designer
 
 Ein kleiner und schlanker Makro-Generator für Windows mit OCR-Unterstützung.
+
+**Version:** 1.0.0 · **Entwickler:** Niclas Kersting  
+**Aktuelles Release:** <https://github.com/NKAutomations/OCR_Macro_MVP/releases/latest>
 
 Mit dem Programm können einfache Abläufe aus mehreren Schritten erstellt werden. Die Schritte werden anschließend automatisch in der festgelegten Reihenfolge ausgeführt.
 
@@ -12,14 +15,19 @@ Mit dem Programm können einfache Abläufe aus mehreren Schritten erstellt werde
 - Klickbereiche auf dem Bildschirm markieren
 - Erkannte Texte in die Zwischenablage kopieren
 - Inhalte aus der Zwischenablage einfügen
+- Fest definierten Text direkt in ein Zielfeld einfügen
 - Enter-Taste automatisch drücken
-- Wartezeiten zwischen einzelnen Schritten festlegen
-- Bis zu 10 Schritte pro Ablauf
+- Wartezeiten zwischen einzelnen Schritten festlegen und komfortabel bearbeiten
+- Keine feste Schrittgrenze (auch umfangreiche Abläufe bis etwa 1000 Schritte sind möglich)
 - Schritte hinzufügen, bearbeiten, löschen und verschieben
 - Abläufe als JSON-Datei speichern und laden
 - Tägliche Ausführung zu einer bestimmten Uhrzeit
 - Ausführung über ein frei einstellbares Intervall
-- Sicherheitsabbruch über die linke obere Bildschirmecke
+- Einstellbare Startverzögerung
+- Einstellbare Mindestpause zwischen allen Schritten
+- Optionales Minimieren des Designer-Fensters beim Start
+- Persistente Tesseract-Einstellung
+- Globaler Sicherheitsabbruch über Strg+Alt+Q
 - Als Windows-EXE paketierbar
 
 ## Voraussetzungen
@@ -67,20 +75,20 @@ Ob Tesseract erkannt wird, kann in der Eingabeaufforderung geprüft werden:
 tesseract --version
 ```
 
-Wenn Tesseract nicht über die Eingabeaufforderung gefunden wird, kann der Pfad später direkt in der GUI ausgewählt werden.
+Wenn Tesseract nicht über die Eingabeaufforderung gefunden wird, kann der Pfad im Tab **Einstellungen** ausgewählt werden. Die Einstellung wird persistent gespeichert.
 
 ## 3. Python-Pakete installieren
 
 Öffne eine Eingabeaufforderung im Projektordner und führe aus:
 
 ```bat
-python -m pip install pillow pytesseract pyautogui pyperclip pyinstaller
+python -m pip install -r requirements.txt
 ```
 
 Falls auf deinem System `python` nicht funktioniert, verwende:
 
 ```bat
-py -m pip install pillow pytesseract pyautogui pyperclip pyinstaller
+py -m pip install -r requirements.txt
 ```
 
 Die Pakete haben folgende Aufgaben:
@@ -118,10 +126,15 @@ Im Edit-Modus wird der Ablauf zusammengestellt.
 - **Klick**
 - **OCR kopieren**
 - **OCR einfügen**
+- **Text einfügen**
+- **Tab-Taste**
+- **Tastenkombination**
+- **Text löschen**
+- **Kommentar/Notiz**
 - **Enter**
 - **Timer**
 
-Es können maximal 10 Schritte angelegt werden.
+Es gibt keine künstliche Begrenzung der Schrittanzahl. Für sehr große Abläufe ist die Bedienung bis ungefähr 1000 Schritte ausgelegt.
 
 ### Klick
 
@@ -131,6 +144,8 @@ Es können maximal 10 Schritte angelegt werden.
 4. Auf dem Bildschirm einen Bereich markieren.
 5. Das Programm klickt später auf die Mitte dieses Bereichs.
 
+Die Desktop-Auswahl kann jederzeit mit **Esc** abgebrochen werden.
+
 ### OCR kopieren
 
 1. Einen OCR-Schritt hinzufügen.
@@ -139,19 +154,41 @@ Es können maximal 10 Schritte angelegt werden.
 4. Den Bildschirmbereich markieren, in dem der Text steht.
 5. Beim Ausführen wird der Text erkannt und in die Zwischenablage kopiert.
 
+Auch die OCR-Auswahl kann jederzeit mit **Esc** abgebrochen werden.
+
 ### OCR einfügen
 
 Dieser Schritt fügt den aktuellen Inhalt der Zwischenablage in das aktuell fokussierte Eingabefeld ein.
 
 Normalerweise wird vorher ein Klickschritt auf das gewünschte Eingabefeld eingefügt.
 
+### Text einfügen
+
+Dieser Schritt fügt einen fest definierten Text in das aktuell fokussierte Eingabefeld ein. Nach dem Hinzufügen öffnet sich ein Bearbeitungsfenster. Der eingegebene Text wird in der Schritteliste angezeigt und kann jederzeit über **Bearbeiten** oder einen Doppelklick geändert werden. Auch mehrzeiliger Text ist möglich.
+
 ### Enter
 
 Drückt beim Ausführen automatisch die Enter-Taste.
 
+### Tab-Taste
+
+Wechselt mit der Tab-Taste zum nächsten fokussierbaren Element.
+
+### Tastenkombination
+
+Führt eine frei definierte Tastenkombination aus. Die Tasten werden mit `+` getrennt eingegeben, zum Beispiel `ctrl+shift+s`.
+
+### Text löschen
+
+Markiert den Inhalt des aktuell fokussierten Feldes mit `Strg+A` und löscht ihn mit der Rücktaste.
+
+### Kommentar/Notiz
+
+Ein frei editierbarer Hinweis in der Schritteliste. Kommentare werden nicht ausgeführt, aber mit Zeitstempel in der Logdatei protokolliert.
+
 ### Timer
 
-Mit einem Timer kann eine Wartezeit in Sekunden eingefügt werden. Das ist beispielsweise nützlich, wenn eine Webseite oder Anwendung nach einem Klick erst geladen werden muss.
+Mit einem Timer kann eine Wartezeit in Sekunden eingefügt werden. Das ist beispielsweise nützlich, wenn eine Webseite oder Anwendung nach einem Klick erst geladen werden muss. Einen Timer auswählen und **Bearbeiten** klicken (oder doppelt anklicken), um die Zeit komfortabel zu ändern.
 
 ## Beispielablauf
 
@@ -195,14 +232,26 @@ Einmal jetzt ausführen
 
 Das Programm führt die Schritte genau in der gespeicherten Reihenfolge aus.
 
+Im Run-Modus stehen zusätzlich folgende Optionen zur Verfügung:
+
+- **Startverzögerung**: Der Ablauf wartet die angegebene Anzahl Sekunden, bevor der erste Schritt ausgeführt wird.
+- **Mindestpause zwischen Schritten**: Nach jedem Schritt wird automatisch mindestens die angegebene Zeit gewartet. Diese Pause ist kein eigener Eintrag in der Schritteliste und ist standardmäßig auf 0,6 Sekunden gesetzt.
+- **Designer-Fenster beim Start minimieren**: Wenn aktiviert, wird das OCR-Macro-Fenster vor der Verzögerung minimiert.
+
 ### Zeitplan
 
 Im Edit-Modus kann zusätzlich ein Zeitplan eingestellt werden:
 
-- täglich zu einer bestimmten Uhrzeit, zum Beispiel `09:00`
-- oder über ein Intervall in Minuten
+- **Deaktiviert**
+- **Täglich** zu einer bestimmten Uhrzeit, zum Beispiel `09:00`
+- **Intervall** in Minuten
 
-Danach wird der Zeitplan über die Schaltfläche **Run-Zeitplan starten** aktiviert.
+Täglich und Intervall sind bewusst getrennt. Es kann immer nur einer der beiden Modi aktiv sein. Danach wird der ausgewählte Zeitplan über die Schaltfläche **Run-Zeitplan starten** aktiviert. In der Statusleiste wird dauerhaft der nächste Ausführungstermin angezeigt.
+
+Die Startoptionen aus dem Run-Modus gelten auch für geplante Ausführungen:
+
+- Startverzögerung vor jedem geplanten Ablauf
+- optionales Minimieren des Designer-Fensters vor jedem geplanten Ablauf
 
 ## Konfiguration speichern
 
@@ -215,15 +264,21 @@ Die Datei enthält unter anderem:
 - OCR-Bereiche
 - Timer-Werte
 - Zeitplan
-- Tesseract-Pfad
+- Startverzögerung und Minimieren-Option
+
+Der Tesseract-Pfad wird im Tab **Einstellungen** einmalig ausgewählt und automatisch unter `%APPDATA%\OCRMacro\settings.json` gespeichert. Danach steht er auch nach einem Neustart zur Verfügung.
 
 Über **Konfiguration laden** kann ein gespeicherter Ablauf später wieder verwendet werden.
 
+Die zuletzt gespeicherte Konfiguration wird beim nächsten Programmstart automatisch geladen, sofern die Datei noch vorhanden ist.
+
+## Protokollierung
+
+Jede Ausführung, jeder Schritt, Fehler, Abbruch und erkannte OCR-Text wird mit Zeitstempel protokolliert. Der Standardpfad ist `%APPDATA%\OCRMacro\ocr_macro.log`. Im Tab **Einstellungen** kann ein anderer Pfad ausgewählt werden.
+
 ## Sicherheitsabbruch
 
-`pyautogui` verfügt über eine Sicherheitsfunktion.
-
-Wenn ein Ablauf läuft und sofort abgebrochen werden soll, bewege den Mauszeiger in die **linke obere Ecke des Bildschirms**.
+Wenn ein Ablauf läuft und sofort abgebrochen werden soll, drücke **Strg+Alt+Q**. Der Tastatur-Abbruch funktioniert auch dann, wenn ein anderes Fenster aktiv ist.
 
 Der Ablauf wird dadurch beendet.
 
@@ -240,8 +295,10 @@ pyinstaller --onefile --noconsole ocr_macro_mvp.py
 Die fertige Datei befindet sich anschließend normalerweise hier:
 
 ```text
-dist\ocr_macro_mvp.exe
+dist\OCR_Macro_MVP_Designer.exe
 ```
+
+Für den veröffentlichten v1.0.0-Release sollte diese EXE als Asset am GitHub-Release angehängt werden.
 
 Die EXE kann anschließend auf einem Windows-Rechner gestartet werden.
 
@@ -279,4 +336,4 @@ C:\Program Files\Tesseract-OCR\tesseract.exe
 
 ## Lizenz
 
-Dieses Projekt kann je nach gewünschter Verwendung unter einer passenden Open-Source-Lizenz veröffentlicht werden, zum Beispiel MIT. Vor der Veröffentlichung sollte die gewünschte Lizenzdatei noch ergänzt werden.
+Dieses Projekt steht unter der MIT-Lizenz. Siehe [LICENSE](LICENSE).

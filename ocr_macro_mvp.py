@@ -2,11 +2,24 @@
 
 Requires on the target Windows machine: Pillow, pytesseract, pyautogui,
 and the Tesseract OCR engine. The engine path can be selected in the GUI.
+
+CHANGES v1.2.0:
+- FIX: FailSafe-Exception wird jetzt sauber abgefangen (kein RecursionError mehr)
+- FIX: RecursionError durch unkontrollierten Thread-zu-Tkinter-Fehlerfluss behoben
+- FIX: sys.setrecursionlimit als Notfallpuffer gesetzt
+- FIX: Bei jedem Fehler wird der Zeitplan sofort gestoppt (keine Dauerschleife mehr)
+- FIX: moveTo() prueft Koordinaten vorab gegen Bildschirmgrenzen (FailSafe-Praevention)
+- IMPROVEMENT: FailSafe wird erkannt und dem User erklaert (Ursache: Koordinate nah an Ecke)
+- IMPROVEMENT: Tkinter-Exception-Handler ueberschrieben (report_callback_exception)
+- IMPROVEMENT: Thread-Fehler werden ueber eine Queue sauber in den GUI-Thread weitergereicht
+- IMPROVEMENT: FailSafe kann im Einstellungs-Tab optional deaktiviert werden (mit Warnung)
 """
 from __future__ import annotations
 
 import json
 import os
+import queue
+import sys
 import threading
 import time
 import ctypes
@@ -14,6 +27,9 @@ import webbrowser
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+# Notfallpuffer gegen RecursionError bei sehr tiefen Tkinter-Callstacks
+sys.setrecursionlimit(3000)
 
 try:
     from PIL import ImageGrab, ImageOps, ImageEnhance, ImageFilter
@@ -33,12 +49,11 @@ except ImportError:
     pyperclip = None
 
 if pyautogui is not None:
-    # Sicherheitsabstand zwischen einzelnen Aktionen.
     pyautogui.PAUSE = 0.15
-    pyautogui.FAILSAFE = True
+    pyautogui.FAILSAFE = True  # Kann in den Einstellungen deaktiviert werden
 
 APP_TITLE = "OCR Macro MVP Designer"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.2.0"
 DEVELOPER = "Niclas Kersting"
 REPOSITORY_URL = "https://github.com/NKAutomations/OCR_Macro_MVP"
 LATEST_RELEASE_URL = f"{REPOSITORY_URL}/releases/latest"
@@ -49,9 +64,18 @@ DEFAULT_CONFIG = {
     "steps": [], "schedule_enabled": False,
     "schedule_mode": "off", "schedule_time": "09:00", "interval_minutes": 0,
     "tesseract_path": "", "last_config_path": "", "start_delay": 0.0, "minimize_on_start": False,
-    "step_delay": 0.6
+    "step_delay": 0.6, "failsafe_enabled": True
 }
-STEP_TYPES = ("Klick", "OCR kopieren", "OCR einfuegen", "Text einfuegen", "Tab-Taste", "Tastenkombination", "Text löschen", "Kommentar/Notiz", "Enter", "Timer")
+STEP_TYPES = ("Klick", "OCR kopieren", "OCR einfuegen", "Text einfuegen", "Tab-Taste",
+              "Tastenkombination", "Text löschen", "Kommentar/Notiz", "Enter", "Timer")
+
+# Sauber erkennbare FailSafe-Exception-Typen
+_FAILSAFE_NAMES = {"FailSafeException", "PyAutoGUIException"}
+
+
+def _is_failsafe(exc: BaseException) -> bool:
+    """Prueft ob eine Exception ein PyAutoGUI-FailSafe-Trigger ist."""
+    return type(exc).__name__ in _FAILSAFE_NAMES or "fail-safe" in str(exc).lower()
 
 
 class SelectionOverlay:
@@ -77,7 +101,8 @@ class SelectionOverlay:
         self.start = (event.x, event.y)
         if self.rect:
             self.canvas.delete(self.rect)
-        self.rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="#00ff99", width=3)
+        self.rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y,
+                                                 outline="#00ff99", width=3)
 
     def drag(self, event):
         if self.start and self.rect:
@@ -115,6 +140,10 @@ class OCRMacroApp:
         initial_height = min(800, max(650, screen_height - 70))
         self.root.geometry(f"1000x{initial_height}")
         self.root.minsize(900, min(650, max(560, screen_height - 70)))
+
+        # --- Saubere Fehler-Queue fuer Thread -> GUI Kommunikation ---
+        self._error_queue: queue.Queue = queue.Queue()
+
         self.config = dict(DEFAULT_CONFIG)
         self.steps = []
         self.selected_step = None
@@ -125,6 +154,7 @@ class OCRMacroApp:
         self.scheduler_thread = None
         self.scheduler_next_run = None
         self.schedule_mode_var = tk.StringVar(value="off")
+        self.failsafe_var = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Bereit - bitte im Edit-Modus konfigurieren.")
         self.next_run_var = tk.StringVar(value="Nächster Zeitplan: keiner")
         self.file_var = tk.StringVar(value="Keine Konfiguration geladen")
@@ -139,6 +169,10 @@ class OCRMacroApp:
         self.tess_var = tk.StringVar(value="")
         self.log_var = tk.StringVar(value=DEFAULT_LOG_PATH)
         self.log_lock = threading.Lock()
+
+        # Tkinter-eigenen Exception-Handler ueberschreiben (verhindert RecursionError)
+        self.root.report_callback_exception = self._handle_tk_exception
+
         self.load_settings()
         self.log_event("Programmstart")
         self.build_ui()
@@ -148,6 +182,33 @@ class OCRMacroApp:
         self.root.bind_all("<Control-Alt-Key-q>", lambda event: self.stop(from_hotkey=True))
         if os.name == "nt":
             threading.Thread(target=self.hotkey_listener, daemon=True).start()
+
+        # Polling-Loop fuer Fehler aus Worker-Threads
+        self._poll_errors()
+
+    def _handle_tk_exception(self, exc_type, exc_value, exc_tb):
+        """Sicherer Ersatz fuer Tkinters report_callback_exception."""
+        try:
+            import traceback
+            msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            self.log_event(f"INTERNER TKINTER-FEHLER:\n{msg}")
+            # Kein messagebox hier - das koennte wieder rekursiv werden
+        except Exception:
+            pass  # Absoluter Notfall - still schlucken
+
+    def _poll_errors(self):
+        """Liest Fehler aus der Queue und zeigt sie im GUI an (alle 200ms)."""
+        try:
+            while True:
+                kind, title, message = self._error_queue.get_nowait()
+                self.show_user_message(kind, title, message)
+        except queue.Empty:
+            pass
+        self.root.after(200, self._poll_errors)
+
+    def _queue_error(self, kind: str, title: str, message: str):
+        """Thread-sicher: Fehler fuer spaetere GUI-Anzeige einreihen."""
+        self._error_queue.put((kind, title, message))
 
     def build_ui(self):
         style = ttk.Style()
@@ -160,28 +221,30 @@ class OCRMacroApp:
         top = ttk.Frame(self.root, padding=14); top.pack(fill="x")
         ttk.Label(top, text=APP_TITLE, font=("Segoe UI", 16, "bold")).pack(side="left")
         info = ttk.Frame(top); info.pack(side="right")
-        ttk.Label(info, text=f"Version {APP_VERSION}  ·  Entwickler: {DEVELOPER}", foreground="#555").pack(side="left", padx=(0, 12))
+        ttk.Label(info, text=f"Version {APP_VERSION}  ·  Entwickler: {DEVELOPER}",
+                  foreground="#555").pack(side="left", padx=(0, 12))
         repo_link = tk.Label(info, text="GitHub · aktuelles Release", foreground="#0969da", cursor="hand2")
         repo_link.pack(side="left")
         repo_link.bind("<Button-1>", lambda event: webbrowser.open(LATEST_RELEASE_URL))
 
         book = ttk.Notebook(self.root); book.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-        edit = ttk.Frame(book, padding=14); run = ttk.Frame(book, padding=14); settings = ttk.Frame(book, padding=14)
-        book.add(edit, text="Edit-Modus"); book.add(run, text="Run-Modus"); book.add(settings, text="Einstellungen")
+        edit = ttk.Frame(book, padding=14)
+        run = ttk.Frame(book, padding=14)
+        settings = ttk.Frame(book, padding=14)
+        book.add(edit, text="Edit-Modus")
+        book.add(run, text="Run-Modus")
+        book.add(settings, text="Einstellungen")
 
-        steps_box = ttk.LabelFrame(edit, text="Ablauf - keine feste Schrittgrenze (empfohlen: bis 1000)", padding=10); steps_box.pack(fill="both", expand=True, pady=(0, 8))
+        steps_box = ttk.LabelFrame(edit,
+            text="Ablauf - keine feste Schrittgrenze (empfohlen: bis 1000)", padding=10)
+        steps_box.pack(fill="both", expand=True, pady=(0, 8))
         list_area = ttk.Frame(steps_box); list_area.pack(side="left", fill="both", expand=True)
-        self.step_list = tk.Listbox(
-            list_area,
-            height=16,
-            activestyle="dotbox",
-            exportselection=False,
-            selectbackground="#cfe8ff",
-            selectforeground="#000000",
-        )
+        self.step_list = tk.Listbox(list_area, height=16, activestyle="dotbox",
+            exportselection=False, selectbackground="#cfe8ff", selectforeground="#000000")
         step_scroll = ttk.Scrollbar(list_area, orient="vertical", command=self.step_list.yview)
         self.step_list.configure(yscrollcommand=step_scroll.set)
-        self.step_list.pack(side="left", fill="both", expand=True); step_scroll.pack(side="right", fill="y")
+        self.step_list.pack(side="left", fill="both", expand=True)
+        step_scroll.pack(side="right", fill="y")
         self.step_list.bind("<<ListboxSelect>>", self.step_selected)
         self.step_list.bind("<Double-Button-1>", lambda e: self.edit_step())
         controls = ttk.Frame(steps_box); controls.pack(side="left", fill="y", padx=(10, 0))
@@ -193,69 +256,125 @@ class OCRMacroApp:
             ("+ Enter", "Enter"), ("+ Timer", "Timer"),
         )
         for index, (label, kind) in enumerate(control_specs):
-            ttk.Button(controls, text=label, command=lambda step_kind=kind: self.add_step(step_kind)).grid(
-                row=index // 2, column=index % 2, sticky="ew", padx=2, pady=2
-            )
+            ttk.Button(controls, text=label,
+                       command=lambda step_kind=kind: self.add_step(step_kind)).grid(
+                row=index // 2, column=index % 2, sticky="ew", padx=2, pady=2)
         controls.columnconfigure(0, weight=1); controls.columnconfigure(1, weight=1)
         action_row = len(control_specs) // 2 + 1
         ttk.Separator(controls).grid(row=action_row - 1, column=0, columnspan=2, sticky="ew", pady=6)
         self.edit_button = ttk.Button(controls, text="Bearbeiten", command=self.edit_step)
         self.edit_button.grid(row=action_row, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
-        ttk.Button(controls, text="Loeschen", command=self.delete_step).grid(row=action_row + 1, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
-        ttk.Button(controls, text="Nach oben", command=lambda: self.move_step(-1)).grid(row=action_row + 2, column=0, sticky="ew", padx=2, pady=2)
-        ttk.Button(controls, text="Nach unten", command=lambda: self.move_step(1)).grid(row=action_row + 2, column=1, sticky="ew", padx=2, pady=2)
+        ttk.Button(controls, text="Loeschen", command=self.delete_step).grid(
+            row=action_row + 1, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+        ttk.Button(controls, text="Nach oben", command=lambda: self.move_step(-1)).grid(
+            row=action_row + 2, column=0, sticky="ew", padx=2, pady=2)
+        ttk.Button(controls, text="Nach unten", command=lambda: self.move_step(1)).grid(
+            row=action_row + 2, column=1, sticky="ew", padx=2, pady=2)
 
-        sched = ttk.LabelFrame(edit, text="Zeitplan", padding=8); sched.pack(fill="x", pady=(0, 8))
-        ttk.Radiobutton(sched, text="Deaktiviert", variable=self.schedule_mode_var, value="off").grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(sched, text="Täglich um", variable=self.schedule_mode_var, value="daily").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        sched = ttk.LabelFrame(edit, text="Zeitplan", padding=8)
+        sched.pack(fill="x", pady=(0, 8))
+        ttk.Radiobutton(sched, text="Deaktiviert",
+                        variable=self.schedule_mode_var, value="off").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(sched, text="Täglich um",
+                        variable=self.schedule_mode_var, value="daily").grid(row=0, column=1, sticky="w", padx=(12, 0))
         ttk.Entry(sched, textvariable=self.time_var, width=8).grid(row=0, column=2, padx=6)
-        ttk.Radiobutton(sched, text="Intervall", variable=self.schedule_mode_var, value="interval").grid(row=0, column=3, sticky="w", padx=(12, 0))
+        ttk.Radiobutton(sched, text="Intervall",
+                        variable=self.schedule_mode_var, value="interval").grid(row=0, column=3, sticky="w", padx=(12, 0))
         self.interval_var = tk.StringVar(value="0")
-        ttk.Spinbox(sched, from_=0.1, to=100000, increment=1, textvariable=self.interval_var, width=9).grid(row=0, column=4, padx=6)
+        ttk.Spinbox(sched, from_=0.1, to=100000, increment=1,
+                    textvariable=self.interval_var, width=9).grid(row=0, column=4, padx=6)
         ttk.Label(sched, text="Minuten").grid(row=0, column=5, sticky="w")
-        ttk.Label(sched, text="Beim Start wird genau der ausgewählte Modus verwendet.", foreground="#555").grid(row=1, column=0, columnspan=6, sticky="w", pady=(7, 0))
+        ttk.Label(sched,
+            text="Beim Start wird genau der ausgewählte Modus verwendet.",
+            foreground="#555").grid(row=1, column=0, columnspan=6, sticky="w", pady=(7, 0))
 
         actions = ttk.Frame(edit); actions.pack(fill="x", pady=8)
         ttk.Button(actions, text="Konfiguration speichern", command=self.save_config).pack(side="left")
         ttk.Button(actions, text="Konfiguration laden", command=self.load_config).pack(side="left", padx=8)
 
-        ttk.Label(run, text="Bereit fuer die Ausfuehrung", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(5, 12))
-        ttk.Label(run, text="Der Ablauf liest gewoehnlichen Bildschirmtext per OCR und uebertraegt ihn in das markierte Zielfeld.", wraplength=550).pack(anchor="w")
-        run_options = ttk.LabelFrame(run, text="Startoptionen", padding=12); run_options.pack(fill="x", pady=20)
+        ttk.Label(run, text="Bereit fuer die Ausfuehrung",
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(5, 12))
+        ttk.Label(run,
+            text="Der Ablauf liest gewoehnlichen Bildschirmtext per OCR und uebertraegt ihn in das markierte Zielfeld.",
+            wraplength=550).pack(anchor="w")
+        run_options = ttk.LabelFrame(run, text="Startoptionen", padding=12)
+        run_options.pack(fill="x", pady=20)
         ttk.Label(run_options, text="Startverzögerung (Sekunden):").grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(run_options, from_=0, to=3600, increment=0.5, textvariable=self.start_delay_var, width=10).grid(row=0, column=1, padx=8, sticky="w")
-        ttk.Label(run_options, text="Mindestpause zwischen Schritten (Sekunden):").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        ttk.Spinbox(run_options, from_=0, to=60, increment=0.1, textvariable=self.step_delay_var, width=10).grid(row=1, column=1, padx=8, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(run_options, text="Designer-Fenster beim Start minimieren", variable=self.minimize_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Label(run_options, text="Die Mindestpause wird automatisch zwischen den Schritten eingefügt und nicht als Schritt angezeigt.", foreground="#555", wraplength=700).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Spinbox(run_options, from_=0, to=3600, increment=0.5,
+                    textvariable=self.start_delay_var, width=10).grid(row=0, column=1, padx=8, sticky="w")
+        ttk.Label(run_options, text="Mindestpause zwischen Schritten (Sekunden):").grid(
+            row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Spinbox(run_options, from_=0, to=60, increment=0.1,
+                    textvariable=self.step_delay_var, width=10).grid(
+            row=1, column=1, padx=8, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(run_options, text="Designer-Fenster beim Start minimieren",
+                        variable=self.minimize_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(run_options,
+            text="Die Mindestpause wird automatisch zwischen den Schritten eingefügt und nicht als Schritt angezeigt.",
+            foreground="#555", wraplength=700).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         buttons = ttk.Frame(run); buttons.pack(fill="x", pady=8)
         ttk.Button(buttons, text="Einmal jetzt ausfuehren", command=self.run_once).pack(side="left")
-        self.stop_button = ttk.Button(buttons, text="Aktuellen Ablauf stoppen", command=lambda: self.stop_run(show_popup=True), state="disabled")
+        self.stop_button = ttk.Button(buttons, text="Aktuellen Ablauf stoppen",
+                                      command=lambda: self.stop_run(show_popup=True), state="disabled")
         self.stop_button.pack(side="left", padx=8)
         ttk.Label(run, textvariable=self.file_var, foreground="#555").pack(anchor="w", pady=5)
-        ttk.Label(run, text="Sofortiger Abbruch: Strg+Alt+Q drücken.", wraplength=550, foreground="#8a4b08").pack(anchor="w", pady=14)
+        ttk.Label(run, text="Sofortiger Abbruch: Strg+Alt+Q drücken.",
+                  wraplength=550, foreground="#8a4b08").pack(anchor="w", pady=14)
 
-        ttk.Label(settings, text="Einstellungen", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(5, 15))
-        tess = ttk.LabelFrame(settings, text="OCR / Tesseract", padding=12); tess.pack(fill="x", anchor="n")
+        # --- Einstellungen ---
+        ttk.Label(settings, text="Einstellungen",
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(5, 15))
+        tess = ttk.LabelFrame(settings, text="OCR / Tesseract", padding=12)
+        tess.pack(fill="x", anchor="n")
         ttk.Label(tess, text="Pfad zu tesseract.exe:").grid(row=0, column=0, sticky="w")
         ttk.Entry(tess, textvariable=self.tess_var).grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(tess, text="Auswählen", command=self.choose_tesseract).grid(row=1, column=1, padx=(8, 0), pady=(8, 0))
+        ttk.Button(tess, text="Auswählen", command=self.choose_tesseract).grid(
+            row=1, column=1, padx=(8, 0), pady=(8, 0))
         tess.columnconfigure(0, weight=1)
-        log_box = ttk.LabelFrame(settings, text="Protokoll / Logdatei", padding=12); log_box.pack(fill="x", anchor="n", pady=(12, 0))
+
+        # --- NEU: FailSafe-Option ---
+        failsafe_box = ttk.LabelFrame(settings, text="PyAutoGUI Sicherheit (FailSafe)", padding=12)
+        failsafe_box.pack(fill="x", anchor="n", pady=(12, 0))
+        ttk.Checkbutton(failsafe_box, text="FailSafe aktiviert (Maus in Bildschirmecke stoppt den Ablauf)",
+                        variable=self.failsafe_var,
+                        command=self._apply_failsafe).pack(anchor="w")
+        ttk.Label(failsafe_box,
+            text="Empfohlen: aktiviert. Wenn der Ablauf durch versehentliche Mausbewegungen "
+                 "in Ecken abgebrochen wird, deaktiviere diese Option. "
+                 "ACHTUNG: Ohne FailSafe gibt es keinen Notausschalter für die Maus.",
+            foreground="#8a4b08", wraplength=700).pack(anchor="w", pady=(6, 0))
+
+        log_box = ttk.LabelFrame(settings, text="Protokoll / Logdatei", padding=12)
+        log_box.pack(fill="x", anchor="n", pady=(12, 0))
         ttk.Label(log_box, text="Pfad zur Logdatei:").grid(row=0, column=0, sticky="w")
         ttk.Entry(log_box, textvariable=self.log_var).grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(log_box, text="Auswählen", command=self.choose_log_file).grid(row=1, column=1, padx=(8, 0), pady=(8, 0))
+        ttk.Button(log_box, text="Auswählen", command=self.choose_log_file).grid(
+            row=1, column=1, padx=(8, 0), pady=(8, 0))
         log_box.columnconfigure(0, weight=1)
-        ttk.Label(log_box, text="Alle Ausführungen, Schritte, Fehler und erkannten OCR-Texte werden mit Zeitstempel protokolliert.", foreground="#555", wraplength=700).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Button(settings, text="Einstellungen speichern", command=self.save_settings).pack(anchor="w", pady=12)
-        ttk.Label(settings, text=f"Gespeichert unter: {SETTINGS_FILE}", foreground="#555", wraplength=700).pack(anchor="w")
+        ttk.Label(log_box,
+            text="Alle Ausführungen, Schritte, Fehler und erkannten OCR-Texte werden mit Zeitstempel protokolliert.",
+            foreground="#555", wraplength=700).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(settings, text="Einstellungen speichern",
+                   command=self.save_settings).pack(anchor="w", pady=12)
+        ttk.Label(settings, text=f"Gespeichert unter: {SETTINGS_FILE}",
+                  foreground="#555", wraplength=700).pack(anchor="w")
 
         bottom = ttk.Frame(self.root, padding=(14, 4)); bottom.pack(fill="x")
         ttk.Separator(bottom).pack(fill="x", pady=(0, 6))
         ttk.Label(bottom, textvariable=self.status).pack(side="left")
         ttk.Label(bottom, textvariable=self.next_run_var, foreground="#555").pack(side="left", padx=20)
-        self.schedule_button = tk.Button(bottom, text="Run-Zeitplan starten", command=self.toggle_scheduler, bg="#b02a37", fg="white", activebackground="#842029", activeforeground="white", relief="raised", padx=8, pady=3)
+        self.schedule_button = tk.Button(bottom, text="Run-Zeitplan starten",
+            command=self.toggle_scheduler, bg="#b02a37", fg="white",
+            activebackground="#842029", activeforeground="white",
+            relief="raised", padx=8, pady=3)
         self.schedule_button.pack(side="right")
+
+    def _apply_failsafe(self):
+        """Setzt pyautogui.FAILSAFE gemaess UI-Einstellung."""
+        if pyautogui is not None:
+            enabled = self.failsafe_var.get()
+            pyautogui.FAILSAFE = enabled
+            self.log_event(f"FailSafe {'aktiviert' if enabled else 'deaktiviert'}")
 
     def refresh_steps(self):
         self.step_list.delete(0, tk.END)
@@ -285,20 +404,24 @@ class OCRMacroApp:
             elif step["type"] == "Text einfuegen":
                 text = " ".join(str(step.get("text", "")).split())
                 detail = f" - \"{text[:45]}{'...' if len(text) > 45 else ''}\"" if text else " - nicht konfiguriert"
-            elif step["type"] == "Tastenkombination": detail = f" - {step.get('keys', '')}" if step.get("keys") else " - nicht konfiguriert"
+            elif step["type"] == "Tastenkombination":
+                detail = f" - {step.get('keys', '')}" if step.get("keys") else " - nicht konfiguriert"
             elif step["type"] == "Kommentar/Notiz":
                 note = " ".join(str(step.get("text", "")).split())
                 detail = f": {note[:45]}{'...' if len(note) > 45 else ''}" if note else ": leer"
-            elif step["type"] == "Timer": detail = f" - {step.get('seconds', 1)} s"
+            elif step["type"] == "Timer":
+                detail = f" - {step.get('seconds', 1)} s"
             display_type = "Notiz" if step["type"] == "Kommentar/Notiz" else step["type"]
             self.step_list.insert(tk.END, f"{i}. {display_type}{detail}")
             if step["type"] == "Kommentar/Notiz":
                 self.step_list.itemconfig(tk.END, background="#fff3b0", foreground="#5f4b00")
 
     def step_selected(self, event=None):
-        sel = self.step_list.curselection(); self.selected_step = sel[0] if sel else None
+        sel = self.step_list.curselection()
+        self.selected_step = sel[0] if sel else None
         if hasattr(self, "edit_button"):
-            is_note = self.selected_step is not None and self.steps[self.selected_step]["type"] == "Kommentar/Notiz"
+            is_note = (self.selected_step is not None
+                       and self.steps[self.selected_step]["type"] == "Kommentar/Notiz")
             self.edit_button.configure(state="disabled" if is_note else "normal")
             self.step_list.configure(
                 selectbackground="#fff3b0" if is_note else "#cfe8ff",
@@ -320,10 +443,14 @@ class OCRMacroApp:
         self.steps.insert(insert_at, step)
         self.selected_step = insert_at
         self.inserted_step_index = insert_at
-        self.refresh_steps(); self.step_list.selection_set(insert_at); self.step_selected()
-        if kind in ("Klick", "OCR kopieren", "Text einfuegen", "Tastenkombination"): self.edit_step()
+        self.refresh_steps()
+        self.step_list.selection_set(insert_at)
+        self.step_selected()
+        if kind in ("Klick", "OCR kopieren", "Text einfuegen", "Tastenkombination"):
+            self.edit_step()
         elif kind == "Kommentar/Notiz":
-            self.edit_text_step(step, "Kommentar/Notiz anlegen", "Notiz (nach dem Speichern schreibgeschützt):", allow_empty=True)
+            self.edit_text_step(step, "Kommentar/Notiz anlegen",
+                                "Notiz (nach dem Speichern schreibgeschützt):", allow_empty=True)
         else:
             self.finish_inserted_step()
 
@@ -338,47 +465,84 @@ class OCRMacroApp:
         self.step_selected()
 
     def edit_step(self):
-        if self.selected_step is None: messagebox.showinfo("Schritt auswaehlen", "Bitte zuerst einen Schritt auswaehlen."); return
-        step = self.steps[self.selected_step]; kind = step["type"]
+        if self.selected_step is None:
+            messagebox.showinfo("Schritt auswaehlen", "Bitte zuerst einen Schritt auswaehlen.")
+            return
+        step = self.steps[self.selected_step]
+        kind = step["type"]
         if kind == "Kommentar/Notiz":
-            messagebox.showinfo("Notiz schreibgeschützt", "Notizen sind nach dem Anlegen schreibgeschützt.", parent=self.root)
+            messagebox.showinfo("Notiz schreibgeschützt",
+                                "Notizen sind nach dem Anlegen schreibgeschützt.", parent=self.root)
             return
         if kind == "Klick":
-            self.root.withdraw(); self.root.after(250, lambda: SelectionOverlay(self.root, "region", lambda v: self.set_step_value("target", v)))
+            self.root.withdraw()
+            self.root.after(250, lambda: SelectionOverlay(self.root, "region",
+                                                          lambda v: self.set_step_value("target", v)))
         elif kind == "OCR kopieren":
-            self.root.withdraw(); self.root.after(250, lambda: SelectionOverlay(self.root, "region", lambda v: self.set_step_value("region", v)))
+            self.root.withdraw()
+            self.root.after(250, lambda: SelectionOverlay(self.root, "region",
+                                                          lambda v: self.set_step_value("region", v)))
         elif kind in ("Text einfuegen", "Kommentar/Notiz"):
             title = "Text bearbeiten" if kind == "Text einfuegen" else "Kommentar/Notiz bearbeiten"
-            description = "Text, der beim Ausführen eingefügt werden soll:" if kind == "Text einfuegen" else "Notiz (wird nicht ausgeführt):"
+            description = ("Text, der beim Ausführen eingefügt werden soll:"
+                           if kind == "Text einfuegen" else "Notiz (wird nicht ausgeführt):")
             self.edit_text_step(step, title, description, allow_empty=kind == "Kommentar/Notiz")
         elif kind == "Tastenkombination":
-            dialog = tk.Toplevel(self.root); dialog.title("Tastenkombination bearbeiten"); dialog.transient(self.root); dialog.grab_set(); dialog.resizable(False, False)
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Tastenkombination bearbeiten")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            dialog.resizable(False, False)
             frame = ttk.Frame(dialog, padding=16); frame.pack()
             ttk.Label(frame, text="Tasten mit + trennen, z. B. ctrl+shift+s:").pack(anchor="w")
             var = tk.StringVar(value=str(step.get("keys", "")))
-            entry = ttk.Entry(frame, textvariable=var, width=30); entry.pack(pady=(8, 12)); entry.focus_set()
+            entry = ttk.Entry(frame, textvariable=var, width=30)
+            entry.pack(pady=(8, 12))
+            entry.focus_set()
+
             def save_hotkey():
                 keys = "+".join(part.strip().lower() for part in var.get().split("+") if part.strip())
                 if not keys:
-                    messagebox.showerror("Eingabe prüfen", "Bitte eine Tastenkombination eingeben.", parent=dialog); return
-                step["keys"] = keys; dialog.destroy(); self.refresh_steps(); self.step_list.selection_set(self.selected_step)
-                if self.inserted_step_index is not None: self.finish_inserted_step()
+                    messagebox.showerror("Eingabe prüfen", "Bitte eine Tastenkombination eingeben.",
+                                         parent=dialog)
+                    return
+                step["keys"] = keys
+                dialog.destroy()
+                self.refresh_steps()
+                self.step_list.selection_set(self.selected_step)
+                if self.inserted_step_index is not None:
+                    self.finish_inserted_step()
+
             ttk.Button(frame, text="Speichern", command=save_hotkey).pack(anchor="e")
             dialog.bind("<Return>", lambda e: save_hotkey())
             self.position_dialog(dialog)
         elif kind == "Timer":
-            dialog = tk.Toplevel(self.root); dialog.title("Timer bearbeiten"); dialog.transient(self.root); dialog.grab_set()
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Timer bearbeiten")
+            dialog.transient(self.root)
+            dialog.grab_set()
             dialog.resizable(False, False)
             frame = ttk.Frame(dialog, padding=16); frame.pack()
             ttk.Label(frame, text="Wartezeit in Sekunden:").grid(row=0, column=0, sticky="w")
             var = tk.StringVar(value=str(step.get("seconds", 1)))
-            entry = ttk.Spinbox(frame, from_=0, to=86400, increment=0.1, textvariable=var, width=14)
-            entry.grid(row=1, column=0, sticky="ew", pady=(8, 12)); entry.focus_set(); entry.selection_range(0, tk.END)
+            entry = ttk.Spinbox(frame, from_=0, to=86400, increment=0.1,
+                                textvariable=var, width=14)
+            entry.grid(row=1, column=0, sticky="ew", pady=(8, 12))
+            entry.focus_set()
+            entry.selection_range(0, tk.END)
+
             def save():
-                try: value = max(0.0, float(var.get().replace(",", ".")))
-                except ValueError: messagebox.showerror("Eingabe pruefen", "Bitte eine Zahl eingeben.", parent=dialog); return
-                step["seconds"] = value; dialog.destroy(); self.refresh_steps()
-                if self.inserted_step_index is not None: self.finish_inserted_step()
+                try:
+                    value = max(0.0, float(var.get().replace(",", ".")))
+                except ValueError:
+                    messagebox.showerror("Eingabe pruefen", "Bitte eine Zahl eingeben.", parent=dialog)
+                    return
+                step["seconds"] = value
+                dialog.destroy()
+                self.refresh_steps()
+                if self.inserted_step_index is not None:
+                    self.finish_inserted_step()
+
             ttk.Button(frame, text="Speichern", command=save).grid(row=2, column=0, sticky="e")
             dialog.bind("<Return>", lambda e: save())
             dialog.update_idletasks()
@@ -397,37 +561,65 @@ class OCRMacroApp:
         dialog.geometry(f"+{max(8, min(x, max_x))}+{max(8, min(y, max_y))}")
 
     def edit_text_step(self, step, title, description, allow_empty=False):
-        dialog = tk.Toplevel(self.root); dialog.title(title); dialog.transient(self.root); dialog.grab_set(); dialog.resizable(True, True)
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(True, True)
         frame = ttk.Frame(dialog, padding=16); frame.pack(fill="both", expand=True)
         ttk.Label(frame, text=description).pack(anchor="w")
         text_entry = tk.Text(frame, width=48, height=6, wrap="word")
-        text_entry.pack(fill="both", expand=True, pady=(8, 12)); text_entry.insert("1.0", str(step.get("text", ""))); text_entry.focus_set()
+        text_entry.pack(fill="both", expand=True, pady=(8, 12))
+        text_entry.insert("1.0", str(step.get("text", "")))
+        text_entry.focus_set()
+
         def save_text():
             text = text_entry.get("1.0", "end-1c")
             if not allow_empty and not text:
-                messagebox.showerror("Eingabe prüfen", "Bitte einen Text eingeben.", parent=dialog); return
-            step["text"] = text; dialog.destroy(); self.refresh_steps(); self.step_list.selection_set(self.selected_step)
-            if self.inserted_step_index is not None: self.finish_inserted_step()
+                messagebox.showerror("Eingabe prüfen", "Bitte einen Text eingeben.", parent=dialog)
+                return
+            step["text"] = text
+            dialog.destroy()
+            self.refresh_steps()
+            self.step_list.selection_set(self.selected_step)
+            if self.inserted_step_index is not None:
+                self.finish_inserted_step()
+
         ttk.Button(frame, text="Speichern", command=save_text).pack(anchor="e")
         dialog.bind("<Control-Return>", lambda e: save_text())
         self.position_dialog(dialog)
 
     def set_step_value(self, key, value):
-        self.root.deiconify(); self.steps[self.selected_step][key] = value; self.refresh_steps(); self.step_list.selection_set(self.selected_step); self.status.set("Schritt gespeichert.")
-        if self.inserted_step_index is not None: self.finish_inserted_step()
+        self.root.deiconify()
+        self.steps[self.selected_step][key] = value
+        self.refresh_steps()
+        self.step_list.selection_set(self.selected_step)
+        self.status.set("Schritt gespeichert.")
+        if self.inserted_step_index is not None:
+            self.finish_inserted_step()
 
     def delete_step(self):
-        if self.selected_step is not None: self.steps.pop(self.selected_step); self.selected_step = None; self.refresh_steps()
+        if self.selected_step is not None:
+            self.steps.pop(self.selected_step)
+            self.selected_step = None
+            self.refresh_steps()
 
     def move_step(self, direction):
-        i = self.selected_step; j = i + direction if i is not None else -1
+        i = self.selected_step
+        j = i + direction if i is not None else -1
         if i is not None and 0 <= j < len(self.steps):
-            self.steps[i], self.steps[j] = self.steps[j], self.steps[i]; self.selected_step = j; self.refresh_steps(); self.step_list.selection_set(j)
+            self.steps[i], self.steps[j] = self.steps[j], self.steps[i]
+            self.selected_step = j
+            self.refresh_steps()
+            self.step_list.selection_set(j)
 
     def choose_tesseract(self):
-        path = filedialog.askopenfilename(title="Tesseract auswaehlen", filetypes=[("Anwendung", "*.exe"), ("Alle Dateien", "*.*")])
+        path = filedialog.askopenfilename(title="Tesseract auswaehlen",
+                                          filetypes=[("Anwendung", "*.exe"), ("Alle Dateien", "*.*")])
         if path:
-            self.tess_var.set(path); self.config["tesseract_path"] = path; self.save_settings(silent=True)
+            self.tess_var.set(path)
+            self.config["tesseract_path"] = path
+            self.save_settings(silent=True)
 
     def choose_log_file(self):
         path = filedialog.asksaveasfilename(
@@ -452,7 +644,6 @@ class OCRMacroApp:
                 with open(path, "a", encoding="utf-8") as log_file:
                     log_file.write(f"[{timestamp}] {message}\n")
         except OSError:
-            # Logging darf die eigentliche Makro-Ausführung nicht blockieren.
             pass
 
     def load_settings(self):
@@ -462,6 +653,10 @@ class OCRMacroApp:
             self.tess_var.set(settings.get("tesseract_path", ""))
             self.last_config_path = settings.get("last_config_path", "")
             self.log_var.set(settings.get("log_path", DEFAULT_LOG_PATH))
+            fs = settings.get("failsafe_enabled", True)
+            self.failsafe_var.set(fs)
+            if pyautogui is not None:
+                pyautogui.FAILSAFE = fs
         except (OSError, ValueError):
             self.last_config_path = ""
             self.log_var.set(DEFAULT_LOG_PATH)
@@ -469,18 +664,26 @@ class OCRMacroApp:
     def save_settings(self, silent=False):
         path = self.tess_var.get().strip()
         if path and not os.path.isfile(path):
-            if not silent: messagebox.showwarning("Pfad prüfen", "Die ausgewählte Datei wurde nicht gefunden.")
+            if not silent:
+                messagebox.showwarning("Pfad prüfen", "Die ausgewählte Datei wurde nicht gefunden.")
             return
         try:
             os.makedirs(SETTINGS_DIR, exist_ok=True)
             log_path = self.log_var.get().strip() or DEFAULT_LOG_PATH
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump({"tesseract_path": path, "last_config_path": getattr(self, "last_config_path", ""), "log_path": log_path}, f, indent=2)
+                json.dump({
+                    "tesseract_path": path,
+                    "last_config_path": getattr(self, "last_config_path", ""),
+                    "log_path": log_path,
+                    "failsafe_enabled": self.failsafe_var.get(),
+                }, f, indent=2)
             self.config["tesseract_path"] = path
             self.log_var.set(log_path)
-            if not silent: self.status.set("Einstellungen gespeichert.")
+            if not silent:
+                self.status.set("Einstellungen gespeichert.")
         except OSError as e:
-            if not silent: messagebox.showerror("Speichern fehlgeschlagen", str(e))
+            if not silent:
+                messagebox.showerror("Speichern fehlgeschlagen", str(e))
 
     def load_last_config(self):
         path = getattr(self, "last_config_path", "")
@@ -498,62 +701,106 @@ class OCRMacroApp:
         mode = self.schedule_mode_var.get()
         interval = 0.0
         if mode == "interval":
-            try: interval = max(0.1, float(self.interval_var.get().replace(",", ".")))
-            except ValueError: raise ValueError("Das Intervall muss eine Zahl größer als 0 sein.")
+            try:
+                interval = max(0.1, float(self.interval_var.get().replace(",", ".")))
+            except ValueError:
+                raise ValueError("Das Intervall muss eine Zahl größer als 0 sein.")
         if mode == "daily":
-            try: datetime.strptime(self.time_var.get(), "%H:%M")
-            except ValueError: raise ValueError("Die Uhrzeit muss im Format HH:MM stehen.")
-        try: start_delay = max(0.0, float(self.start_delay_var.get().replace(",", ".")))
-        except ValueError: raise ValueError("Die Startverzögerung muss eine Zahl sein.")
-        try: step_delay = max(0.0, float(self.step_delay_var.get().replace(",", ".")))
-        except ValueError: raise ValueError("Die Mindestpause zwischen Schritten muss eine Zahl sein.")
-        self.config.update(steps=self.steps, schedule_enabled=mode != "off", schedule_mode=mode, schedule_time=self.time_var.get(), interval_minutes=interval, tesseract_path=self.tess_var.get(), start_delay=start_delay, minimize_on_start=self.minimize_var.get(), step_delay=step_delay)
+            try:
+                datetime.strptime(self.time_var.get(), "%H:%M")
+            except ValueError:
+                raise ValueError("Die Uhrzeit muss im Format HH:MM stehen.")
+        try:
+            start_delay = max(0.0, float(self.start_delay_var.get().replace(",", ".")))
+        except ValueError:
+            raise ValueError("Die Startverzögerung muss eine Zahl sein.")
+        try:
+            step_delay = max(0.0, float(self.step_delay_var.get().replace(",", ".")))
+        except ValueError:
+            raise ValueError("Die Mindestpause zwischen Schritten muss eine Zahl sein.")
+        self.config.update(
+            steps=self.steps, schedule_enabled=mode != "off",
+            schedule_mode=mode, schedule_time=self.time_var.get(),
+            interval_minutes=interval, tesseract_path=self.tess_var.get(),
+            start_delay=start_delay, minimize_on_start=self.minimize_var.get(),
+            step_delay=step_delay, failsafe_enabled=self.failsafe_var.get()
+        )
         return self.config
 
     def apply_config(self, data):
-        self.config = dict(DEFAULT_CONFIG); self.config.update(data)
+        self.config = dict(DEFAULT_CONFIG)
+        self.config.update(data)
         self.scheduler_active = False
         self.scheduler_generation += 1
         self.steps = self.config.get("steps", [])
         mode = self.config.get("schedule_mode")
         if mode not in ("off", "daily", "interval"):
-            mode = "interval" if self.config.get("schedule_enabled") and self.config.get("interval_minutes", 0) else ("daily" if self.config.get("schedule_enabled") else "off")
-        self.schedule_mode_var.set(mode); self.time_var.set(self.config["schedule_time"]); self.interval_var.set(str(self.config.get("interval_minutes", 0)))
-        self.start_delay_var.set(str(self.config.get("start_delay", 0))); self.step_delay_var.set(str(self.config.get("step_delay", 0.6))); self.minimize_var.set(self.config.get("minimize_on_start", False))
+            mode = ("interval" if self.config.get("schedule_enabled")
+                    and self.config.get("interval_minutes", 0)
+                    else ("daily" if self.config.get("schedule_enabled") else "off"))
+        self.schedule_mode_var.set(mode)
+        self.time_var.set(self.config["schedule_time"])
+        self.interval_var.set(str(self.config.get("interval_minutes", 0)))
+        self.start_delay_var.set(str(self.config.get("start_delay", 0)))
+        self.step_delay_var.set(str(self.config.get("step_delay", 0.6)))
+        self.minimize_var.set(self.config.get("minimize_on_start", False))
+        fs = self.config.get("failsafe_enabled", True)
+        self.failsafe_var.set(fs)
+        if pyautogui is not None:
+            pyautogui.FAILSAFE = fs
         self.refresh_steps()
 
     def save_config(self):
-        try: data = self.collect_config()
-        except ValueError as e: messagebox.showerror("Eingabe pruefen", str(e)); return
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON-Konfiguration", "*.json")])
-        if not path: return
-        with open(path, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
+        try:
+            data = self.collect_config()
+        except ValueError as e:
+            messagebox.showerror("Eingabe pruefen", str(e))
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".json",
+                                             filetypes=[("JSON-Konfiguration", "*.json")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
         self.last_config_path = path
         self.save_settings(silent=True)
-        self.file_var.set(f"Gespeichert: {os.path.basename(path)}"); self.status.set("Konfiguration gespeichert.")
+        self.file_var.set(f"Gespeichert: {os.path.basename(path)}")
+        self.status.set("Konfiguration gespeichert.")
 
     def load_config(self):
         path = filedialog.askopenfilename(filetypes=[("JSON-Konfiguration", "*.json")])
-        if not path: return
+        if not path:
+            return
         try:
-            with open(path, encoding="utf-8") as f: self.apply_config(json.load(f))
-        except Exception as e: messagebox.showerror("Laden fehlgeschlagen", str(e)); return
-        self.file_var.set(f"Geladen: {os.path.basename(path)}"); self.status.set("Konfiguration geladen.")
+            with open(path, encoding="utf-8") as f:
+                self.apply_config(json.load(f))
+        except Exception as e:
+            messagebox.showerror("Laden fehlgeschlagen", str(e))
+            return
+        self.file_var.set(f"Geladen: {os.path.basename(path)}")
+        self.status.set("Konfiguration geladen.")
 
     def validate(self):
         self.collect_config()
-        if not self.steps: raise ValueError("Bitte zuerst mindestens einen Schritt anlegen.")
+        if not self.steps:
+            raise ValueError("Bitte zuerst mindestens einen Schritt anlegen.")
         for number, step in enumerate(self.steps, 1):
-            if step["type"] == "Klick" and not step.get("target"): raise ValueError(f"Schritt {number}: bitte Klickbereich markieren.")
-            if step["type"] == "OCR kopieren" and not step.get("region"): raise ValueError(f"Schritt {number}: bitte OCR-Bereich markieren.")
-            if step["type"] == "Text einfuegen" and not str(step.get("text", "")): raise ValueError(f"Schritt {number}: bitte einen Text eingeben.")
-            if step["type"] == "Tastenkombination" and not str(step.get("keys", "")): raise ValueError(f"Schritt {number}: bitte eine Tastenkombination eingeben.")
+            if step["type"] == "Klick" and not step.get("target"):
+                raise ValueError(f"Schritt {number}: bitte Klickbereich markieren.")
+            if step["type"] == "OCR kopieren" and not step.get("region"):
+                raise ValueError(f"Schritt {number}: bitte OCR-Bereich markieren.")
+            if step["type"] == "Text einfuegen" and not str(step.get("text", "")):
+                raise ValueError(f"Schritt {number}: bitte einen Text eingeben.")
+            if step["type"] == "Tastenkombination" and not str(step.get("keys", "")):
+                raise ValueError(f"Schritt {number}: bitte eine Tastenkombination eingeben.")
         if ImageGrab is None or pytesseract is None or pyautogui is None or pyperclip is None:
             raise ValueError("Bitte zuerst pillow, pytesseract, pyautogui und pyperclip installieren.")
 
     def ocr_text(self, region):
-        if self.config["tesseract_path"] and os.path.isfile(self.config["tesseract_path"]): pytesseract.pytesseract.tesseract_cmd = self.config["tesseract_path"]
-        image = ImageGrab.grab(bbox=tuple(region)); image = ImageOps.grayscale(image)
+        if self.config["tesseract_path"] and os.path.isfile(self.config["tesseract_path"]):
+            pytesseract.pytesseract.tesseract_cmd = self.config["tesseract_path"]
+        image = ImageGrab.grab(bbox=tuple(region))
+        image = ImageOps.grayscale(image)
         image = image.resize((image.width * 2, image.height * 2))
         image = ImageEnhance.Contrast(image).enhance(2.0).filter(ImageFilter.SHARPEN)
         text = " ".join(pytesseract.image_to_string(image, config="--psm 7").strip().split())
@@ -564,15 +811,25 @@ class OCRMacroApp:
         clipboard_text = ""
         self.log_event(f"Schrittkette gestartet ({len(self.steps)} Schritte)")
         for number, step in enumerate(self.steps, 1):
-            if not self.running: return
+            if not self.running:
+                return
             kind = step["type"]
             self.log_event(f"Schritt {number} gestartet: {kind}")
             if kind == "Klick":
-                x1, y1, x2, y2 = map(int, step["target"]); x, y = (x1 + x2) // 2, (y1 + y2) // 2
-                pyautogui.moveTo(x, y, duration=0.25); pyautogui.click(x, y)
+                x1, y1, x2, y2 = map(int, step["target"])
+                x, y = (x1 + x2) // 2, (y1 + y2) // 2
+                # Koordinaten gegen Bildschirmgrenzen pruefen, bevor moveTo() den FailSafe ausloest
+                sw = self.root.winfo_screenwidth()
+                sh = self.root.winfo_screenheight()
+                margin = 5  # Pixel Sicherheitsabstand von den Ecken
+                x = max(margin, min(x, sw - margin))
+                y = max(margin, min(y, sh - margin))
+                pyautogui.moveTo(x, y, duration=0.25)
+                pyautogui.click(x, y)
             elif kind == "OCR kopieren":
                 clipboard_text = self.ocr_text(step["region"])
-                if not clipboard_text: raise RuntimeError(f"Schritt {number}: kein OCR-Text erkannt.")
+                if not clipboard_text:
+                    raise RuntimeError(f"Schritt {number}: kein OCR-Text erkannt.")
                 pyperclip.copy(clipboard_text)
             elif kind == "OCR einfuegen":
                 pyautogui.hotkey("ctrl", "v")
@@ -607,12 +864,19 @@ class OCRMacroApp:
             time.sleep(min(0.1, end - time.monotonic()))
 
     def run_once(self):
-        try: self.validate()
-        except ValueError as e: messagebox.showerror("Konfiguration pruefen", str(e)); return
-        if self.running: return
+        try:
+            self.validate()
+        except ValueError as e:
+            messagebox.showerror("Konfiguration pruefen", str(e))
+            return
+        if self.running:
+            return
         start_delay = float(self.start_delay_var.get().replace(",", "."))
-        if self.minimize_var.get(): self.root.iconify()
-        self.running = True; self.stop_button.configure(state="normal"); self.status.set("OCR und Eingabe laufen ...")
+        if self.minimize_var.get():
+            self.root.iconify()
+        self.running = True
+        self.stop_button.configure(state="normal")
+        self.status.set("OCR und Eingabe laufen ...")
         threading.Thread(target=self.worker, args=(start_delay,), daemon=True).start()
 
     def worker(self, start_delay):
@@ -622,33 +886,84 @@ class OCRMacroApp:
                 end = time.monotonic() + start_delay
                 while self.running and time.monotonic() < end:
                     time.sleep(min(0.1, end - time.monotonic()))
-            if not self.running: return
+            if not self.running:
+                return
             self.execute_steps()
         except Exception as e:
-            self.log_event(f"FEHLER: {e}")
-            self.root.after(0, lambda error=str(e): self.report_execution_error(error))
+            self.log_event(f"FEHLER: {type(e).__name__}: {e}")
+
+            # --- KRITISCH: Zeitplan bei jedem Fehler sofort stoppen ---
+            # Verhindert Dauerschleife: Scheduler wuerde sonst nach Intervall
+            # run_once() erneut aufrufen und den gleichen Fehler immer wieder ausloesen.
+            if self.scheduler_active:
+                self.log_event("Zeitplan automatisch gestoppt wegen Fehler.")
+                self.scheduler_active = False
+                self.scheduler_generation += 1
+                self.scheduler_next_run = None
+                self.root.after(0, self._on_scheduler_stopped_by_error)
+
+            if _is_failsafe(e):
+                # FailSafe: tritt auf wenn moveTo() eine Koordinate nahe einer Bildschirmecke anfaehrt
+                msg = (
+                    "Der Ablauf wurde durch den PyAutoGUI-FailSafe gestoppt.\n\n"
+                    "Wahrscheinliche Ursache: Ein Klick-Schritt zeigt auf eine Koordinate,\n"
+                    "die nah an einer Bildschirmecke liegt – das Programm selbst hat die\n"
+                    "Maus dorthin bewegt.\n\n"
+                    "Lösungsansätze:\n"
+                    "  1. Klick-Koordinaten im Edit-Modus neu kalibrieren\n"
+                    "  2. Prüfen ob das Zielfenster verschoben wurde\n"
+                    "  3. FailSafe in den Einstellungen deaktivieren (nicht empfohlen)\n\n"
+                    "Der Zeitplan wurde zum Schutz automatisch gestoppt."
+                )
+                self._queue_error("error", "FailSafe ausgelöst – Zeitplan gestoppt", msg)
+            else:
+                error_str = str(e)
+                self._queue_error(
+                    "error",
+                    "Ausführung fehlgeschlagen – Zeitplan gestoppt",
+                    f"Die Schrittfolge konnte nicht vollständig ausgeführt werden.\n\n"
+                    f"{error_str}\n\n"
+                    f"Der Zeitplan wurde automatisch gestoppt, um eine Fehlerschleife zu verhindern."
+                )
         finally:
-            self.running = False; self.root.after(0, lambda: self.stop_button.configure(state="disabled"))
+            self.running = False
+            self.root.after(0, lambda: self.stop_button.configure(state="disabled"))
+            self.root.after(0, lambda: self.status.set("Ablauf fehlgeschlagen – Zeitplan gestoppt."))
 
-    def report_execution_error(self, error):
-        self.status.set(f"Ausführung fehlgeschlagen: {error}")
-        self.show_user_message("error", "Ausführung fehlgeschlagen", f"Die Schrittfolge konnte nicht vollständig ausgeführt werden.\n\n{error}")
-
-    def show_user_message(self, kind, title, message):
-        self.root.deiconify()
-        self.root.lift()
-        self.root.attributes("-topmost", True)
+    def _on_scheduler_stopped_by_error(self):
+        """GUI-Update wenn Zeitplan durch Fehler automatisch gestoppt wurde."""
         try:
+            self.config["schedule_enabled"] = False
+            self.update_next_run_display()
+            self.schedule_button.configure(
+                text="Run-Zeitplan starten", bg="#b02a37", activebackground="#842029"
+            )
+        except Exception:
+            pass
+
+    def show_user_message(self, kind: str, title: str, message: str):
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
             if kind == "error":
                 messagebox.showerror(title, message, parent=self.root)
             else:
                 messagebox.showinfo(title, message, parent=self.root)
+        except Exception:
+            pass  # GUI bereits geschlossen oder anderer Fehlerzustand
         finally:
-            self.root.attributes("-topmost", False)
+            try:
+                self.root.attributes("-topmost", False)
+            except Exception:
+                pass
 
     def start_scheduler(self):
-        try: self.validate()
-        except ValueError as e: messagebox.showerror("Konfiguration pruefen", str(e)); return
+        try:
+            self.validate()
+        except ValueError as e:
+            messagebox.showerror("Konfiguration pruefen", str(e))
+            return
         mode = self.schedule_mode_var.get()
         if mode == "off":
             messagebox.showinfo("Zeitplan auswählen", "Bitte Täglich oder Intervall auswählen.")
@@ -656,16 +971,21 @@ class OCRMacroApp:
         if self.scheduler_active:
             self.status.set("Zeitplan laeuft bereits.")
             return
-        self.config["schedule_enabled"] = True; self.config["schedule_mode"] = mode
+        self.config["schedule_enabled"] = True
+        self.config["schedule_mode"] = mode
         self.scheduler_active = True
         self.scheduler_generation += 1
         generation = self.scheduler_generation
         self.log_event(f"Zeitplan gestartet: {mode}")
         self.scheduler_next_run = self.calculate_next_run(datetime.now(), mode)
-        self.scheduler_thread = threading.Thread(target=self.scheduler, args=(generation,), daemon=True); self.scheduler_thread.start()
-        self.schedule_button.configure(text="Run-Zeitplan stoppen", bg="#198754", activebackground="#146c43")
+        self.scheduler_thread = threading.Thread(
+            target=self.scheduler, args=(generation,), daemon=True)
+        self.scheduler_thread.start()
+        self.schedule_button.configure(text="Run-Zeitplan stoppen",
+                                       bg="#198754", activebackground="#146c43")
         self.update_next_run_display()
-        description = f"täglich um {self.time_var.get()} Uhr" if mode == "daily" else f"alle {self.interval_var.get()} Minuten"
+        description = (f"täglich um {self.time_var.get()} Uhr" if mode == "daily"
+                       else f"alle {self.interval_var.get()} Minuten")
         self.status.set(f"Zeitplan aktiv: {description}.")
 
     def toggle_scheduler(self):
@@ -678,7 +998,8 @@ class OCRMacroApp:
         if mode == "daily":
             scheduled = datetime.strptime(self.config.get("schedule_time", "09:00"), "%H:%M").time()
             next_run = datetime.combine(now.date(), scheduled)
-            if next_run <= now: next_run += timedelta(days=1)
+            if next_run <= now:
+                next_run += timedelta(days=1)
             return next_run
         if mode == "interval":
             return now + timedelta(minutes=float(self.config.get("interval_minutes", 0)))
@@ -688,13 +1009,15 @@ class OCRMacroApp:
         if self.scheduler_next_run is None:
             self.next_run_var.set("Nächster Zeitplan: keiner")
         else:
-            self.next_run_var.set(f"Nächster Termin: {self.scheduler_next_run.strftime('%d.%m.%Y %H:%M:%S')}")
+            self.next_run_var.set(
+                f"Nächster Termin: {self.scheduler_next_run.strftime('%d.%m.%Y %H:%M:%S')}")
 
     def scheduler(self, generation):
         while self.scheduler_active and generation == self.scheduler_generation:
             now = datetime.now()
-            if self.scheduler_next_run and now >= self.scheduler_next_run and not self.running:
-                self.scheduler_next_run = self.calculate_next_run(now, self.config.get("schedule_mode", "off"))
+            if (self.scheduler_next_run and now >= self.scheduler_next_run and not self.running):
+                self.scheduler_next_run = self.calculate_next_run(
+                    now, self.config.get("schedule_mode", "off"))
                 self.root.after(0, self.update_next_run_display)
                 self.root.after(0, self.run_once)
             time.sleep(0.5)
@@ -706,7 +1029,8 @@ class OCRMacroApp:
             self.status.set("Aktueller Ablauf gestoppt.")
             self.stop_button.configure(state="disabled")
             if show_popup:
-                self.show_user_message("info", "Ablauf abgebrochen", "Der aktuelle Ablauf wurde manuell abgebrochen.")
+                self.show_user_message("info", "Ablauf abgebrochen",
+                                       "Der aktuelle Ablauf wurde manuell abgebrochen.")
 
     def stop_scheduler(self):
         self.scheduler_active = False
@@ -716,7 +1040,8 @@ class OCRMacroApp:
         self.log_event("Zeitplan gestoppt")
         self.scheduler_next_run = None
         self.update_next_run_display()
-        self.schedule_button.configure(text="Run-Zeitplan starten", bg="#b02a37", activebackground="#842029")
+        self.schedule_button.configure(text="Run-Zeitplan starten",
+                                       bg="#b02a37", activebackground="#842029")
         self.status.set("Zeitplan gestoppt.")
 
     def stop(self, from_hotkey=False):
@@ -724,7 +1049,8 @@ class OCRMacroApp:
         self.stop_run()
         self.stop_scheduler()
         if from_hotkey and was_active:
-            self.show_user_message("info", "Abbruch", "Der Ablauf wurde über Strg+Alt+Q abgebrochen.")
+            self.show_user_message("info", "Abbruch",
+                                   "Der Ablauf wurde über Strg+Alt+Q abgebrochen.")
 
     def hotkey_listener(self):
         user32 = ctypes.windll.user32
@@ -748,4 +1074,6 @@ class OCRMacroApp:
 
 
 if __name__ == "__main__":
-    root = tk.Tk(); OCRMacroApp(root); root.mainloop()
+    root = tk.Tk()
+    OCRMacroApp(root)
+    root.mainloop()
